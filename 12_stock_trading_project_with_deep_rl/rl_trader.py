@@ -179,5 +179,214 @@ class MultiStockEnv:
         info = {'cur_val': cur_val}
 
         # conform to the Gym API
-        return self._get_obs(), rewards, done, info
+        return self._get_obs(), reward, done, info
+
+    def _get_obs(self):
+        obs = np.empty(self.state_dim)
+        obs[:self.n_stock] = self.stock_owned
+        obs[self.n_stock:2*self.n_stock] = self.stock_price
+        obs[-1] = self.cash_in_hand
+        return obs
+
+    def _get_val(self):
+        return self.stock_owned.dot(self.stock_price) + self.cash_in_hand
+
+    def _trade(self, action):
+        """
+        index the action we want to perform
+        0 = sell
+        1 = hold
+        2 = buy
+
+        e.g. [2,1,0] means:
+        buy first stock
+        hold second stock
+        sell third stock
+        """
+        action_vec = self.action_list[action]
+
+        # determine which stocks to buy or sell
+        sell_index = []     # stores index of stocks to sell
+        buy_index = []      # stores index of stocks to buy
+
+        for i, a in enumerate(action_vec):
+            if a == 0:
+                sell_index.append(i)
+            elif a == 2:
+                buy_index.append(i)
+
+        # sell any stocks we want to sell
+        # then buy any stocks we want to buy
+
+        if sell_index:
+            # NOTE: to simplify the problem, when we sell, we will sell ALL shares of that stock
+            for i in sell_index:
+                self.cash_in_hand += self.stock_price[i] * self.stock_owned[i]
+                self.stock_owned[i] = 0
+
+        if buy_index:
+            # NOTE: when buying, we will loop through each stock we want to buy,
+            # and buy one share at a time until we run out of cash
+            can_buy = True
+            while can_buy:
+                for i in buy_index:
+                    if self.cash_in_hand > self.stock_price[i]:
+                        self.stock_owned[i] += 1    # buy one share
+                        self.cash_in_hand -= self.stock_price[i]
+                    else:
+                        can_buy = False
+
+
+
+class DQNAgent(object):
+    def __init__(self, state_size, action_size):
+        self.state_size = state_size
+        self.action_size = action_size
+        self.memory = ReplayBuffer(state_size, action_size, size=500)
+        self.gamma = 0.95       # discount rate
+        self.epsilon = 1.0      # exploration rate
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.995
+        self.model = mlp(state_size, action_size)
+
+    def update_replay_memory(self, state, action, reward, next_state, done):
+        self.memory.store(state, action, reward, next_state, done)
+
+    def act(self, state):
+        if np.random.rand() <= self.epsilon:
+            return np.random.choice(self.action_size)
+        act_values = self.model.predict(state)
+        return np.argmax(act_values[0])     # returns action
+
+    def replay(self, batch_size=32):
+        # first check if replay buffer contains enough data
+        if self.memory.size < batch_size:
+            return
+
+        # sample a batch of data form the replay memory
+        minibatch = self.memory.sample_batch(batch_size)
+        states = minibatch['s']
+        actions = minibatch['a']
+        rewards = minibatch['r']
+        next_states = minibatch['s2']
+        done = minibatch['d']
+
+        # calculate the tentative target: Q(s', a)
+        # the value of terminal state is zero, so target is just rewards
+        target = rewards + (1-done) * self.gamma * np.amax(self.model.predict(next_states), axis=1)
+
+        # With Keras API, target (usually) must have the same shape as predictions
+        # However, we only need to update the network for the actions which were actually taken
+        # We can accomplish this by setting the target to be equal to the prediction for all values
+        # Then, only change the targets for the actions taken
+        # Q(s, a)
+        target_full = self.model.predict(states)
+        target_full[np.arange(batch_size), actions] = target
+
+        # run on one training step
+        self.model.train_on_batch(states, target_full)
+
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+
+    def load(self, name):
+        self.model.load_weights(name)
+
+    def save(self, name):
+        self.model.save_weights(name)
+
+
+def play_one_episode(agent, env, is_train):
+    # note: after transforming states are already 1xD
+    state = env.reset()
+    state = scaler.transform([state])
+    done = False
+
+    while not done:
+        action = agent.act(state)
+        next_state, reward, done, info = env.step(action)
+        next_state = scaler.transform([next_state])
+
+        if is_train == 'train':
+            agent.update_replay_memory(state, action, reward, next_state, done)
+            agent.replay(batch_size)
+        state = next_state
+
+    return info['cur_val']
+
+
+if __name__ == '__main__':
+    # config
+    models_folder = 'rl_trader_models'
+    rewards_folder = 'rl_trader_rewards'
+    num_episodes = 2000
+    batch_size = 32
+    initial_investment = 20000
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-m', '--mode', type=str, required=True,
+                        help='either "train" or "test"')
+
+    args = parser.parse_args()
+
+    maybe_make_dir(models_folder)
+    maybe_make_dir(rewards_folder)
+
+    data = get_data()
+    n_timesteps, n_stocks = data.shape
+
+    n_train = n_timesteps // 2
+
+    train_data = data[:n_train]
+    test_data = data[n_train:]
+
+    env = MultiStockEnv(train_data, initial_investment)
+    state_size = env.state_dim
+    action_size = len(env.action_space)
+    agent = DQNAgent(state_size, action_size)
+    scaler = get_scaler(env)
+
+    # store the final value of the portfolio (end of episode)
+    portfolio_value = []
+
+    if args.mode == 'test':
+        # then load the previous scaler
+        with open(f'{models_folder}.scaler.pkl', 'rb') as f:
+            scaler = pickle.load(f)
+
+        # remake the env with test data
+        env = MultiStockEnv(test_data, initial_investment)
+
+        # make sure epsilon is NOT 1
+        # no need to run multiple episodes if epsilon = 0, it's deterministic
+        agent.epsilon = 0.01
+
+        # load trained weights
+        agent.load(f'{models_folder}.dqn.h5')
+
+    # play the game num_episodes times
+    for e in range(num_episodes):
+        t0 = datetime.now()
+        val = play_one_episode(agent, env, args.mode)
+        dt = datetime.now() - t0
+        print(f"episode: {e + 1}/{num_episodes}, episode end value: {val:.2f}, duration: {dt}")
+        portfolio_value.append(val)     # append episode end portfolio value
+
+    # save the weights when we're done
+    if args.mode == 'train':
+        # save the dqn
+        agent.save(f'{models_folder}/dqn.h5')
+
+        # save the scaler
+        with open(f'{models_folder}/scaler.pkl', 'wb') as f:
+            pickle.dump(scaler, f)
+
+    # save portfolio value for each episode
+    np.save(f'{rewards_folder}/{args.mode}.npy', portfolio_value)
+
+
+
+
+
 
