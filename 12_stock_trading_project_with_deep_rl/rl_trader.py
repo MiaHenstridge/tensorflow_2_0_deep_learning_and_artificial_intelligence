@@ -121,7 +121,7 @@ class MultiStockEnv:
         - 1 = hold
         - 2 = buy
     """
-    def __int__(self, data, initial_investment=20000):
+    def __init__(self, data, initial_investment=20000):
         # data
         self.stock_price_history = data
         self.n_step, self.n_stock = self.stock_price_history.shape
@@ -157,7 +157,7 @@ class MultiStockEnv:
         assert action in self.action_space
 
         # get current value before performing the action
-        prev_val - self._get_val()
+        prev_val = self._get_val()
 
         # update price, i.e., go to the next day
         self.cur_step += 1
@@ -341,7 +341,7 @@ if __name__ == '__main__':
     train_data = data[:n_train]
     test_data = data[n_train:]
 
-    env = MultiStockEnv(train_data, initial_investment)
+    env = MultiStockEnv(data=train_data, initial_investment=initial_investment)
     state_size = env.state_dim
     action_size = len(env.action_space)
     agent = DQNAgent(state_size, action_size)
